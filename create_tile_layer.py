@@ -1,7 +1,7 @@
 import math
 
 from PyQt5.QtGui import QColor, QFont
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal
 
 from qgis.core import (
     QgsProject,
@@ -25,6 +25,9 @@ zoom = None  # None の場合、キャンバスの表示状態から自動推定
 # Webメルカトル定義
 ORIGIN_SHIFT = 20037508.342789244
 TILE_SIZE = 256
+
+# グローバル変数（レイヤ管理用）
+tile_layer_manager = None
 
 def resolution(z):
     return (2 * ORIGIN_SHIFT) / (TILE_SIZE * 2 ** z)
@@ -68,101 +71,164 @@ def get_canvas_zoom(iface) -> int:
     z_float = math.log2((2 * ORIGIN_SHIFT) / (TILE_SIZE * meters_per_pixel))
     z_int = int(round(z_float))
     
-    print(f"スケール: {scale:.0f}, DPI: {dpi:.1f}")
-    print(f"解像度: {meters_per_pixel:.6f} m/px")
-    print(f"推定されたズームレベル: z ≒ {z_float:.2f} → {z_int}")
+    # print(f"スケール: {scale:.0f}, DPI: {dpi:.1f}")
+    # print(f"解像度: {meters_per_pixel:.6f} m/px")
+    # print(f"推定されたズームレベル: z ≒ {z_float:.2f} → {z_int}")
     return z_int
 
-if zoom is None:
-    zoom = get_canvas_zoom(iface)
 
-# ==== 表示範囲取得 ==== #
-canvas = iface.mapCanvas()
-extent = canvas.extent()
-canvas_crs = canvas.mapSettings().destinationCrs()
-epsg3857 = QgsCoordinateReferenceSystem("EPSG:3857")
+class TileLayerManager(QObject):
+    """地図の変更に応じてタイルレイヤを自動更新するマネージャー"""
+    
+    def __init__(self, iface):
+        super().__init__()
+        self.iface = iface
+        self.canvas = iface.mapCanvas()
+        self.current_layer = None
+        self.zoom_setting = zoom  # グローバル設定を保持
+        
+        # 地図の変更イベントに接続
+        self.canvas.extentsChanged.connect(self.update_tile_layer)
+        self.canvas.scaleChanged.connect(self.update_tile_layer)
+        
+        # 初回作成
+        self.update_tile_layer()
+        
+    def disconnect_signals(self):
+        """シグナルを切断（スクリプト再実行時のクリーンアップ用）"""
+        try:
+            self.canvas.extentsChanged.disconnect(self.update_tile_layer)
+            self.canvas.scaleChanged.disconnect(self.update_tile_layer)
+        except:
+            pass
+    
+    def remove_current_layer(self):
+        """現在のタイルレイヤを削除"""
+        if self.current_layer:
+            QgsProject.instance().removeMapLayer(self.current_layer)
+            self.current_layer = None
+    
+    def create_tile_layer(self, zoom_level):
+        """指定されたズームレベルでタイルレイヤを作成"""
+        # ==== 表示範囲取得 ==== #
+        extent = self.canvas.extent()
+        canvas_crs = self.canvas.mapSettings().destinationCrs()
+        epsg3857 = QgsCoordinateReferenceSystem("EPSG:3857")
 
-# ---- キャンバス範囲を EPSG:3857 に変換 ----
-if canvas_crs != epsg3857:
-    xfm = QgsCoordinateTransform(canvas_crs, epsg3857, QgsProject.instance())
-    ext = xfm.transformBoundingBox(extent)
-else:
-    ext = extent
+        # ---- キャンバス範囲を EPSG:3857 に変換 ----
+        if canvas_crs != epsg3857:
+            xfm = QgsCoordinateTransform(canvas_crs, epsg3857, QgsProject.instance())
+            ext = xfm.transformBoundingBox(extent)
+        else:
+            ext = extent
 
-minx, maxx = ext.xMinimum(), ext.xMaximum()
-miny, maxy = ext.yMinimum(), ext.yMaximum()
+        minx, maxx = ext.xMinimum(), ext.xMaximum()
+        miny, maxy = ext.yMinimum(), ext.yMaximum()
 
-# ---- 表示範囲にかかるタイル範囲 ----
-min_tx, max_ty = mercator_to_tile(minx, miny, zoom)
-max_tx, min_ty = mercator_to_tile(maxx, maxy, zoom)
-tx0, tx1 = sorted([min_tx, max_tx])
-ty0, ty1 = sorted([min_ty, max_ty])
+        # ---- 表示範囲にかかるタイル範囲 ----
+        min_tx, max_ty = mercator_to_tile(minx, miny, zoom_level)
+        max_tx, min_ty = mercator_to_tile(maxx, maxy, zoom_level)
+        tx0, tx1 = sorted([min_tx, max_tx])
+        ty0, ty1 = sorted([min_ty, max_ty])
 
-# ==== レイヤ作成 ==== #
-layer_name = f"tiles_z{zoom}"
-vl = QgsVectorLayer("Polygon?crs=EPSG:3857", layer_name, "memory")
-pr = vl.dataProvider()
+        # ==== レイヤ作成 ==== #
+        layer_name = f"tile_boundary"
+        vl = QgsVectorLayer("Polygon?crs=EPSG:3857", layer_name, "memory")
+        pr = vl.dataProvider()
 
-pr.addAttributes([
-    QgsField("z", QVariant.Int),
-    QgsField("x", QVariant.Int),
-    QgsField("y", QVariant.Int),
-])
-vl.updateFields()
+        pr.addAttributes([
+            QgsField("z", QVariant.Int),
+            QgsField("x", QVariant.Int),
+            QgsField("y", QVariant.Int),
+        ])
+        vl.updateFields()
 
-# ==== タイル境界ポリゴン生成 ==== #
-features = []
-for tx in range(tx0, tx1 + 1):
-    for ty in range(ty0, ty1 + 1):
-        minx, miny, maxx, maxy = tile_bounds(tx, ty, zoom)
-        pts = [
-            QgsPointXY(minx, miny),
-            QgsPointXY(maxx, miny),
-            QgsPointXY(maxx, maxy),
-            QgsPointXY(minx, maxy),
-            QgsPointXY(minx, miny),
-        ]
-        feat = QgsFeature(vl.fields())
-        feat.setGeometry(QgsGeometry.fromPolygonXY([pts]))
-        feat["z"] = zoom
-        feat["x"] = tx
-        feat["y"] = ty
-        features.append(feat)
+        # ==== タイル境界ポリゴン生成 ==== #
+        features = []
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                minx, miny, maxx, maxy = tile_bounds(tx, ty, zoom_level)
+                pts = [
+                    QgsPointXY(minx, miny),
+                    QgsPointXY(maxx, miny),
+                    QgsPointXY(maxx, maxy),
+                    QgsPointXY(minx, maxy),
+                    QgsPointXY(minx, miny),
+                ]
+                feat = QgsFeature(vl.fields())
+                feat.setGeometry(QgsGeometry.fromPolygonXY([pts]))
+                feat["z"] = zoom_level
+                feat["x"] = tx
+                feat["y"] = ty
+                features.append(feat)
 
-pr.addFeatures(features)
-vl.updateExtents()
+        pr.addFeatures(features)
+        vl.updateExtents()
 
-symbol = QgsFillSymbol.createSimple({
-    'style': 'no',                  # 塗りつぶしなし
-    'outline_color': '255,0,0',       # 線色（赤）
-    'outline_width': '0.3',         # 線の太さ（mm）
-})
-vl.setRenderer(QgsSingleSymbolRenderer(symbol))
+        # スタイル設定
+        symbol = QgsFillSymbol.createSimple({
+            'style': 'no',                  # 塗りつぶしなし
+            'outline_color': '255,0,0',       # 線色（赤）
+            'outline_width': '0.3',         # 線の太さ（mm）
+        })
+        vl.setRenderer(QgsSingleSymbolRenderer(symbol))
 
-# ---- ラベル設定: (z/ x/ y) を中央に表示 ----
-pal = QgsPalLayerSettings()
-pal.enabled = True
+        # ---- ラベル設定: (z/ x/ y) を中央に表示 ----
+        pal = QgsPalLayerSettings()
+        pal.enabled = True
 
-pal.fieldName = 'concat("z", \'/ \', "x", \'/ \', "y")'
-pal.isExpression = True
-pal.centroidInside = True
-pal.dist = 0
+        pal.fieldName = 'concat("z", \'/ \', "x", \'/ \', "y")'
+        pal.isExpression = True
+        pal.centroidInside = True
+        pal.dist = 0
 
-text_format = QgsTextFormat()
-font = QFont()
-font.setPointSize(8)
-text_format.setFont(font)
-text_format.setColor(QColor(0, 0, 0))
-buffer = text_format.buffer()
-buffer.setEnabled(True)
-buffer.setSize(1)  # 太さ（pxまたはmm換算）
-buffer.setColor(QColor(255, 255, 255))
-text_format.setBuffer(buffer)
-pal.setFormat(text_format)
+        text_format = QgsTextFormat()
+        font = QFont()
+        font.setPointSize(8)
+        text_format.setFont(font)
+        text_format.setColor(QColor(0, 0, 0))
+        buffer = text_format.buffer()
+        buffer.setEnabled(True)
+        buffer.setSize(1)  # 太さ（pxまたはmm換算）
+        buffer.setColor(QColor(255, 255, 255))
+        text_format.setBuffer(buffer)
+        pal.setFormat(text_format)
 
-labeling = QgsVectorLayerSimpleLabeling(pal)
-vl.setLabeling(labeling)
-vl.setLabelsEnabled(True)
+        labeling = QgsVectorLayerSimpleLabeling(pal)
+        vl.setLabeling(labeling)
+        vl.setLabelsEnabled(True)
 
-# プロジェクトに追加
-QgsProject.instance().addMapLayer(vl)
+        return vl
+    
+    def update_tile_layer(self):
+        """地図の変更に応じてタイルレイヤを更新"""
+        # 現在のズームレベルを取得
+        if self.zoom_setting is None:
+            current_zoom = get_canvas_zoom(self.iface)
+        else:
+            current_zoom = self.zoom_setting
+        
+        # 既存のレイヤを削除
+        self.remove_current_layer()
+        
+        # 新しいレイヤを作成
+        self.current_layer = self.create_tile_layer(current_zoom)
+        
+        # プロジェクトに追加
+        QgsProject.instance().addMapLayer(self.current_layer)
+        
+        print(f"タイルレイヤを更新しました (ズームレベル: {current_zoom})")
+
+
+# ==== メイン実行部分 ==== #
+# 既存のマネージャーがあればクリーンアップ
+try:
+    if tile_layer_manager:
+        tile_layer_manager.disconnect_signals()
+        tile_layer_manager.remove_current_layer()
+except:
+    pass
+
+# 新しいマネージャーを作成
+tile_layer_manager = TileLayerManager(iface)
+print("タイル自動更新機能が有効になりました。地図をパンまたはズームすると自動的にタイルレイヤが更新されます。")
